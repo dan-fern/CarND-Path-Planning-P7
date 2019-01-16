@@ -1,0 +1,740 @@
+#include <fstream>
+#include <math.h>
+#include <uWS/uWS.h>
+#include <chrono>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+#include "src/Eigen-3.3/Eigen/Core"
+#include "src/Eigen-3.3/Eigen/QR"
+#include "json.hpp"
+#include "trajectory.hpp"
+#include "vehicle.hpp"
+#include "cost.hpp"
+
+
+using namespace std;
+
+// for convenience
+using json = nlohmann::json;
+
+// For converting back and forth between radians and degrees.
+constexpr double pi() { return M_PI; }
+double deg2rad(double x) { return x * pi() / 180; }
+double rad2deg(double x) { return x * 180 / pi(); }
+
+// Checks if the SocketIO event has JSON data.
+// If there is data the JSON object in string format will be returned,
+// else the empty string "" will be returned.
+string hasData(string s) {
+  auto found_null = s.find("null");
+  auto b1 = s.find_first_of("[");
+  auto b2 = s.find_first_of("}");
+  if (found_null != string::npos) {
+    return "";
+  } else if (b1 != string::npos && b2 != string::npos) {
+    return s.substr(b1, b2 - b1 + 2);
+  }
+  return "";
+}
+
+double distance(double x1, double y1, double x2, double y2)
+{
+	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
+}
+int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+
+	double closestLen = 100000; //large number
+	int closestWaypoint = 0;
+
+	for(int i = 0; i < maps_x.size(); i++)
+	{
+		double map_x = maps_x[i];
+		double map_y = maps_y[i];
+		double dist = distance(x,y,map_x,map_y);
+		if(dist < closestLen)
+		{
+			closestLen = dist;
+			closestWaypoint = i;
+		}
+
+	}
+
+	return closestWaypoint;
+
+}
+
+int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+
+	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
+
+	double map_x = maps_x[closestWaypoint];
+	double map_y = maps_y[closestWaypoint];
+
+	double heading = atan2((map_y-y),(map_x-x));
+
+	double angle = fabs(theta-heading);
+    angle = min(2*pi() - angle, angle);
+
+    if(angle > pi()/4)
+    {
+        closestWaypoint++;
+        if (closestWaypoint == maps_x.size())
+        {
+            closestWaypoint = 0;
+        }
+    }
+
+    return closestWaypoint;
+}
+
+// Transform from Cartesian x,y coordinates to Frenet s,d coordinates
+vector<double> getFrenet(
+        double x,
+        double y,
+        double theta,
+        vector<double> maps_x,
+        vector<double> maps_y,
+        vector<double> maps_s )
+{
+	int next_wp = NextWaypoint( x, y, theta, maps_x, maps_y );
+
+	int prev_wp = next_wp - 1;
+
+	if( next_wp == 0 )
+	{
+		prev_wp  = maps_x.size( ) - 1;
+	}
+
+	double n_x = maps_x[ next_wp ] - maps_x[ prev_wp ];
+	double n_y = maps_y[ next_wp ] - maps_y[ prev_wp ];
+	double x_x = x - maps_x[ prev_wp ];
+	double x_y = y - maps_y[ prev_wp ];
+
+	// find the projection of x onto n
+	double proj_norm = ( x_x * n_x + x_y * n_y ) / ( n_x * n_x + n_y * n_y );
+	double proj_x = proj_norm * n_x;
+	double proj_y = proj_norm * n_y;
+
+	double frenet_d = distance( x_x, x_y, proj_x, proj_y );
+
+	//see if d value is positive or negative by comparing it to a center point
+
+	double center_x = 1000 - maps_x[ prev_wp ];
+	double center_y = 2000 - maps_y[ prev_wp ];
+	double centerToPos = distance( center_x, center_y, x_x, x_y );
+	double centerToRef = distance( center_x, center_y, proj_x, proj_y );
+
+	if( centerToPos <= centerToRef )
+	{
+		frenet_d *= -1;
+	}
+
+	// calculate s value
+	double frenet_s = maps_s[0];
+	for( int i = 0; i < prev_wp; i++ )
+	{
+		frenet_s += distance( maps_x[i], maps_y[i], maps_x[i+1], maps_y[i+1] );
+	}
+
+	frenet_s += distance( 0, 0, proj_x, proj_y );
+
+	return { frenet_s, frenet_d };
+
+}
+
+// Transform from Frenet s,d coordinates to Cartesian x,y
+vector<double> getXY(
+        double s,
+        double d,
+        const vector<double> &maps_s,
+        const vector<double> &maps_x,
+        const vector<double> &maps_y )
+{
+	int prev_wp = -1;
+
+	while( s > maps_s[prev_wp + 1] && ( prev_wp < (int)( maps_s.size( ) - 1 ) ) )
+	{
+		prev_wp++;
+	}
+
+	int wp2 = ( prev_wp + 1 ) % maps_x.size( );
+
+	double heading = atan2( ( maps_y[wp2] - maps_y[prev_wp] ),
+            ( maps_x[wp2] - maps_x[prev_wp] ) );
+
+    // the x,y,s along the segment
+	double seg_s = ( s - maps_s[prev_wp] );
+
+	double seg_x = maps_x[ prev_wp ] + seg_s * cos( heading );
+	double seg_y = maps_y[ prev_wp ] + seg_s * sin( heading );
+
+	double perp_heading = heading-pi( ) / 2;
+
+	double x = seg_x + d * cos( perp_heading );
+	double y = seg_y + d * sin( perp_heading );
+
+	return { x, y };
+
+}
+
+int main( )
+{
+    uWS::Hub h;
+
+    // Load up map values for waypoint's x,y,s and d normalized normal vectors
+    vector<double> map_waypoints_x;
+    vector<double> map_waypoints_y;
+    vector<double> map_waypoints_s;
+    vector<double> map_waypoints_dx;
+    vector<double> map_waypoints_dy;
+
+    Vehicle my_car = Vehicle( );
+
+    // Waypoint map to read from
+    string map_file_ = "../data/highway_map.csv";
+
+    // The max s value before wrapping around the track back to 0
+    double max_s = 6945.554;
+
+    ifstream in_map_( map_file_.c_str( ), ifstream::in );
+    ofstream log_file;
+    log_file.open( "path_planning_log.csv" );
+
+    string line;
+    while( getline( in_map_, line ) )
+    {
+    	istringstream iss(line);
+    	double x;
+    	double y;
+    	float s;
+    	float d_x;
+    	float d_y;
+    	iss >> x;
+    	iss >> y;
+    	iss >> s;
+    	iss >> d_x;
+    	iss >> d_y;
+    	map_waypoints_x.push_back(x);
+    	map_waypoints_y.push_back(y);
+    	map_waypoints_s.push_back(s);
+    	map_waypoints_dx.push_back(d_x);
+    	map_waypoints_dy.push_back(d_y);
+    }
+
+    h.onMessage( [
+            &map_waypoints_x,
+            &map_waypoints_y,
+            &map_waypoints_s,
+            &map_waypoints_dx,
+            &map_waypoints_dy,
+            &my_car,
+            &log_file ]
+            ( uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode )
+    {
+    // "42" at the start of the message means there's a websocket message event.
+    // The 4 signifies a websocket message.  The 2 signifies a websocket event
+
+    if( length && length > 2 && data[ 0 ] == '4' && data[ 1 ] == '2' )
+    {
+
+        auto s = hasData( data );
+
+        if( s != "" )
+        {
+            auto j = json::parse( s );
+
+            string event = j[0].get<string>( );
+
+            if (event == "telemetry")
+            {
+            	// Main vehicle localization Data
+              	double car_x = j[1]["x"];
+              	double car_y = j[1]["y"];
+              	double car_s = j[1]["s"];
+              	double car_d = j[1]["d"];
+              	double car_yaw = j[1]["yaw"];
+              	double car_speed = j[1]["speed"];
+
+              	// Previous path data given to the Planner
+              	auto previous_path_x = j[1]["previous_path_x"];
+              	auto previous_path_y = j[1]["previous_path_y"];
+
+                // Previous path's end s and d values
+              	double end_path_s = j[1]["end_path_s"];
+              	double end_path_d = j[1]["end_path_d"];
+
+              	// Sensor Fusion Data, or all other cars on this side of road.
+              	auto sensor_fusion = j[1]["sensor_fusion"];
+
+              	json msgJson;
+
+              	vector<double> next_x_vals;
+              	vector<double> next_y_vals;
+
+                // ******* INTERPOLATE WAYPOINTS OF NEARBY AREA *************
+                int num_wp = map_waypoints_x.size( );
+
+                int next_wp_ind = NextWaypoint(
+                        car_x,
+                        car_y,
+                        car_yaw,
+                        map_waypoints_x,
+                        map_waypoints_y );
+
+                vector<double> raw_wp_s, raw_wp_x, raw_wp_y, raw_wp_dx, raw_wp_dy;
+                for(int i = -NUM_WAYPOINTS_BEHIND; i < NUM_WAYPOINTS_AHEAD; i++)
+                {
+                    // smooth by taking previous and soe esubsequent waypoints
+	                int idx = ( next_wp_ind + i ) % num_wp;
+	                if( idx < 0 )
+                    {
+    					// correct for wrap
+    					idx += num_wp;
+    				}
+
+                    // correct for wrap in s for spline interpolation
+    				double current_s = map_waypoints_s[ idx ];
+    				double base_s = map_waypoints_s[ next_wp_ind ];
+
+    				if( i < 0 && current_s > base_s )
+                    {
+    					current_s -= TRACK_LENGTH;
+    				}
+    				if( i > 0 && current_s < base_s )
+                    {
+    					current_s += TRACK_LENGTH;
+    				}
+
+                    raw_wp_s.push_back( current_s );
+    				raw_wp_x.push_back( map_waypoints_x[ idx ] );
+    				raw_wp_y.push_back( map_waypoints_y[ idx ] );
+    				raw_wp_dx.push_back( map_waypoints_dx[ idx ] );
+    				raw_wp_dy.push_back( map_waypoints_dy[ idx ] );
+    			}
+
+            double dist_inc = 0.5;
+            int num_inter_pts = ( raw_wp_s[ raw_wp_s.size( ) - 1 ]
+                    - raw_wp_s[ 0 ] ) / dist_inc;
+
+            vector<double> int_wp_s, int_wp_x, int_wp_y, int_wp_dx, int_wp_dy;
+
+            // interpolated s
+            int_wp_s.push_back( raw_wp_s[ 0 ] );
+
+            for( int i = 1; i < num_inter_pts; i++ )
+            {
+                int_wp_s.push_back( raw_wp_s[ 0 ] + i * dist_inc );
+            }
+
+            int_wp_x = interpolate(
+                    raw_wp_s,
+                    raw_wp_x,
+                    dist_inc,
+                    num_inter_pts );
+
+            int_wp_y = interpolate(
+                    raw_wp_s,
+                    raw_wp_y,
+                    dist_inc,
+                    num_inter_pts );
+
+            int_wp_dx = interpolate(
+                    raw_wp_s,
+                    raw_wp_dx,
+                    dist_inc,
+                    num_inter_pts );
+
+            int_wp_dy = interpolate(
+                    raw_wp_s,
+                    raw_wp_dy,
+                    dist_inc,
+                    num_inter_pts );
+
+            // *** DETERMINE EGO CAR PARAMETERS AND CONSTRUCT VEHICLE OBJECT ***
+            // Class def requires s, s_d, s_dd, d, d_d, d_dd - in order
+            double pos_s, s_dot, s_ddot, pos_d, d_dot, d_ddot;
+
+            double pos_x, pos_y, pos_x2, pos_y2, pos_x3, pos_y3, angle;
+
+            double vel_x1, vel_y1, vel_x2, vel_y2, acc_x, acc_y;
+
+            int subpath_size = min(
+                    PREVIOUS_PATH_POINTS_TO_KEEP,
+                    (int)previous_path_x.size( ) );
+
+            double traj_start_time = subpath_size * PATH_DT;
+
+            // use default values if not enough previous path points
+            if ( subpath_size < 4 )
+            {
+                pos_x = car_x;
+                pos_y = car_y;
+                angle = deg2rad( car_yaw );
+                pos_s = car_s;
+                pos_d = car_d;
+                s_dot = car_speed;
+                d_dot = 0;
+                s_ddot = 0;
+                d_ddot = 0;
+            }
+            else
+            {
+                // current position is last point of previous path to be kept
+                pos_x = previous_path_x[ subpath_size - 1 ];
+                pos_y = previous_path_y[ subpath_size - 1 ];
+                pos_x2 = previous_path_x[ subpath_size - 2 ];
+                pos_y2 = previous_path_y[ subpath_size - 2 ];
+                angle = atan2( pos_y - pos_y2, pos_x - pos_x2 );
+
+                vector<double> frenet = getFrenet(
+                        pos_x,
+                        pos_y,
+                        angle,
+                        int_wp_x,
+                        int_wp_y,
+                        int_wp_s );
+
+                pos_s = frenet[0];
+                pos_d = frenet[1];
+
+                // from a set of interpolated waypoints, determine dx, dy vector
+                // with pos_x, pos_y as reference point; interpolated waypoints
+                // are ~1m apart while path points are about < 0.5m apart, these
+                // values can be reused for previous two points (and using the
+                // previous waypoint data may be more accurate) to calculate
+                // vel_s (s_dot), vel_d (d_dot), acc_s (s_ddot), acc_d (d_ddot)
+
+                int next_int_wp_ind = NextWaypoint(
+                        pos_x,
+                        pos_y,
+                        angle,
+                        int_wp_x,
+                        int_wp_y);
+
+                double dx = int_wp_dx[ next_int_wp_ind - 1 ];
+                double dy = int_wp_dy[ next_int_wp_ind - 1 ];
+
+                // sx,sy vector is perpendicular to dx,dy
+                double sx = -dy;
+                double sy = dx;
+
+                // calculate s_dot & d_dot
+                vel_x1 = ( pos_x - pos_x2 ) / PATH_DT;
+                vel_y1 = ( pos_y - pos_y2 ) / PATH_DT;
+
+                // project xy velocity vector onto S (sx,sy) and D (dx,dy)
+                // vectors.  Since S and D are unit vectors, this is simply
+                // the dot products of V with S and V with D
+                s_dot = vel_x1 * sx + vel_y1 * sy;
+                d_dot = vel_x1 * dx + vel_y1 * dy;
+
+                // use xy acceleration, get new point, calculate s_ddot, d_ddot
+                pos_x3 = previous_path_x[ subpath_size - 3 ];
+                pos_y3 = previous_path_y[ subpath_size - 3 ];
+
+                vel_x2 = ( pos_x2 - pos_x3 ) / PATH_DT;
+                vel_y2 = ( pos_y2 - pos_y3 ) / PATH_DT;
+
+                acc_x = ( vel_x1 - vel_x2 ) / PATH_DT;
+                acc_y = ( vel_y1 - vel_y2 ) / PATH_DT;
+
+                s_ddot = acc_x * sx + acc_y * sy;
+                d_ddot = acc_x * dx + acc_y * dy;
+
+                // try, instead, differentiating trajectory coefficients
+                double eval_time, pos_s2, pos_d2, s_dot2, d_dot2, s_ddot2, d_ddot2;
+
+                vector<double> s_dot_coeffs =
+                        my_car.differentiate_coeffs( my_car.s_traj_coeffs );
+                vector<double> d_dot_coeffs =
+                        my_car.differentiate_coeffs( my_car.d_traj_coeffs );
+
+                vector<double> s_ddot_coeffs =
+                        my_car.differentiate_coeffs( s_dot_coeffs );
+                vector<double> d_ddot_coeffs =
+                        my_car.differentiate_coeffs( d_dot_coeffs );
+
+                eval_time = ( NUM_PATH_POINTS - subpath_size ) * PATH_DT;
+
+                pos_s2 = my_car.evaluate_coeffs_at_time(
+                        my_car.s_traj_coeffs,
+                        eval_time );
+                pos_d2 = my_car.evaluate_coeffs_at_time(
+                        my_car.d_traj_coeffs,
+                        eval_time );
+
+                s_dot2 = my_car.evaluate_coeffs_at_time(
+                        s_dot_coeffs,
+                        eval_time );
+                d_dot2 = my_car.evaluate_coeffs_at_time(
+                        d_dot_coeffs,
+                        eval_time );
+
+                s_ddot2 = my_car.evaluate_coeffs_at_time(
+                        s_ddot_coeffs,
+                        eval_time );
+                d_ddot2 = my_car.evaluate_coeffs_at_time(
+                        d_ddot_coeffs,
+                        eval_time );
+
+            }
+
+            my_car.s    = pos_s;           // s position
+            my_car.s_d  = s_dot;           // s dot - velocity in s
+            my_car.s_dd = s_ddot;          // s dot-dot - acceleration in s
+            my_car.d    = pos_d;           // d position
+            my_car.d_d  = d_dot;           // d dot - velocity in d
+            my_car.d_dd = d_ddot;          // d dot-dot - acceleration in d
+
+            // ****** GENERATE PREDICTIONS FROM SENSOR FUSION DATA ********
+            // Data format for each car is: [ id, x, y, vx, vy, s, d].
+            // id is a unique identifier for that car.
+            // x, y values are in global map coordinates,
+            // vx, vy values are the velocity components
+            // s and d are the Frenet coordinates for that car.
+            double duration = N_SAMPLES * DT - subpath_size * PATH_DT;
+
+            vector<Vehicle> other_cars;
+
+            map<int, vector<vector<double>>> predictions;
+
+            for( auto sf: sensor_fusion )
+            {
+                double other_car_v = sqrt(
+                        pow( (double)sf[3], 2 ) + pow( (double)sf[4], 2 ) );
+
+                Vehicle other_car = Vehicle( sf[5], other_car_v, 0, sf[6], 0, 0 );
+
+                other_cars.push_back( other_car );
+
+                int v_id = sf[0];
+
+                vector<vector<double>> preds = other_car.generate_predictions(
+                        traj_start_time, duration );
+
+                predictions[v_id] = preds;
+            }
+
+            // if any other car is immediately to left or right, set a flag
+            bool car_on_left = false, car_on_right = false, car_ahead = false;
+
+            for( Vehicle other_car: other_cars )
+            {
+                double s_diff = fabs( other_car.s - car_s );
+
+                if( s_diff < FOLLOW_DISTANCE )
+                {
+                    cout << "s diff: " << s_diff << endl;
+                    double d_diff = other_car.d - car_d;
+                    if( d_diff > 2 && d_diff < 6 )
+                    {
+                        car_on_right = true;
+                    }
+                    else if( d_diff < -2 && d_diff > -6 )
+                    {
+                        car_on_left = true;
+                    }
+                    else if( d_diff > -2 && d_diff < 2 )
+                    {
+                        car_ahead = true;
+                    }
+                }
+            }
+
+            // *************** DETERMINE BEST TRAJECTORY ***************
+            // trajectories come back in a list of s and d values
+			my_car.update_available_moves( car_on_left, car_on_right );
+
+			vector<vector<double>> best_frenet_traj, best_target;
+			double best_cost = 999999;
+			string best_traj_state = "";
+
+            for( string state: my_car.available_states )
+            {
+                vector<vector<double>> target_s_and_d = my_car.get_move_target(
+                        state,
+                        predictions,
+                        duration,
+                        car_ahead );
+
+                vector<vector<double>> possible_traj =
+                        my_car.generate_target_traj( target_s_and_d, duration );
+
+                double current_cost = calculate_total_cost(
+                        possible_traj[0],
+                        possible_traj[1],
+                        predictions );
+
+                if( current_cost < best_cost )
+                {
+                        best_cost = current_cost;
+                        best_frenet_traj = possible_traj;
+                        best_traj_state = state;
+                        best_target = target_s_and_d;
+                }
+            }
+
+            my_car.prior_state = best_traj_state;
+
+            cout << "Best State: " << my_car.prior_state << endl;
+
+            // ********************* PRODUCE NEW PATH ***********************
+            // begin by pushing last and penultimate point from previous path
+            // for setting the spline the last point should be the first point
+            // in the returned trajectory, also add that point manually
+
+            vector<double> raw_s_traj, raw_x_traj, raw_y_traj;
+            vector<double> inter_s_traj, inter_x_traj, inter_y_traj;
+
+            double prev_s = pos_s - s_dot * PATH_DT;
+
+            // first two points of raw trajectory, to ensure spline begins
+            if (subpath_size >= 2)
+            {
+                raw_s_traj.push_back( prev_s );
+                raw_x_traj.push_back( previous_path_x[ subpath_size - 2 ] );
+                raw_y_traj.push_back( previous_path_y[ subpath_size - 2 ] );
+                raw_s_traj.push_back( pos_s);
+                raw_x_traj.push_back( previous_path_x[ subpath_size - 1 ] );
+                raw_y_traj.push_back( previous_path_y[ subpath_size - 1 ] );
+            }
+            else
+            {
+                double prev_s = pos_s - 1;
+                double prev_x = pos_x - cos( angle );
+                double prev_y = pos_y - sin( angle );
+                raw_s_traj.push_back( prev_s );
+                raw_x_traj.push_back( prev_x );
+                raw_y_traj.push_back( prev_y );
+                raw_s_traj.push_back( pos_s );
+                raw_x_traj.push_back( pos_x );
+                raw_y_traj.push_back( pos_y );
+            }
+
+            // last two points of raw trajectory
+            double target_s1 = pos_s + 30;
+            double target_d1 = best_target[1][0];
+            vector<double> target_xy1 =
+                    getXY( target_s1, target_d1, int_wp_s, int_wp_x, int_wp_y );
+            double target_x1 = target_xy1[0];
+            double target_y1 = target_xy1[1];
+
+            raw_s_traj.push_back( target_s1 );
+            raw_x_traj.push_back( target_x1 );
+            raw_y_traj.push_back( target_y1 );
+
+            double target_s2 = target_s1 + 30;
+            double target_d2 = target_d1;
+            vector<double> target_xy2 =
+                    getXY( target_s2, target_d2, int_wp_s, int_wp_x, int_wp_y );
+            double target_x2 = target_xy2[0];
+            double target_y2 = target_xy2[1];
+
+            raw_s_traj.push_back( target_s2 );
+            raw_x_traj.push_back( target_x2 );
+            raw_y_traj.push_back( target_y2 );
+
+            double target_s_dot = best_target[0][1];
+            double current_s = pos_s;
+            double current_v = s_dot;
+            double current_a = s_ddot;
+
+            for( int i = 0; i < ( NUM_PATH_POINTS - subpath_size ); i++ )
+            {
+                double v_incr, a_incr;
+                if( fabs( target_s_dot - current_v ) < 2 * VELOCITY_INCREMENT_LIMIT )
+                {
+                    v_incr = 0;
+                }
+                else
+                {
+                    // arrived at VELOCITY_INCREMENT_LIMIT value empirically
+                    v_incr = ( target_s_dot - current_v ) /
+                            ( fabs( target_s_dot - current_v ) ) *
+                            VELOCITY_INCREMENT_LIMIT;
+                }
+
+                current_v += v_incr;
+                current_s += current_v * PATH_DT;
+                inter_s_traj.push_back( current_s );
+
+            }
+
+            inter_x_traj = interpolate(
+                    raw_s_traj,
+                    raw_x_traj,
+                    inter_s_traj );
+            inter_y_traj = interpolate(
+                    raw_s_traj,
+                    raw_y_traj,
+                    inter_s_traj );
+
+            // add previous path, if any, to next path
+            for( int i = 0; i < subpath_size; i++ )
+            {
+                next_x_vals.push_back( previous_path_x[ i ] );
+                next_y_vals.push_back( previous_path_y[ i ] );
+            }
+
+            // add xy points from newly generated path
+            for( int i = 0; i < inter_x_traj.size( ); i++ )
+            {
+                next_x_vals.push_back( inter_x_traj[ i ] );
+                next_y_vals.push_back( inter_y_traj[ i ] );
+            }
+
+          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+          	msgJson["next_x"] = next_x_vals;
+          	msgJson["next_y"] = next_y_vals;
+
+          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+
+          	//this_thread::sleep_for(chrono::milliseconds(1000));
+          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+
+        }
+      } else {
+        // Manual driving
+        std::string msg = "42[\"manual\",{}]";
+        ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+      }
+    }
+  });
+
+  // We don't need this since we're not using HTTP but if it's removed the
+  // program
+  // doesn't compile :-(
+  h.onHttpRequest([](uWS::HttpResponse *res, uWS::HttpRequest req, char *data,
+                     size_t, size_t) {
+    const std::string s = "<h1>Hello world!</h1>";
+    if (req.getUrl().valueLength == 1) {
+      res->end(s.data(), s.length());
+    } else {
+      // i guess this should be done more gracefully?
+      res->end(nullptr, 0);
+    }
+  });
+
+  h.onConnection([&h](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
+    std::cout << "Connected!!!" << std::endl;
+  });
+
+  h.onDisconnection([&h](uWS::WebSocket<uWS::SERVER> ws, int code,
+                         char *message, size_t length) {
+    ws.close();
+    std::cout << "Disconnected" << std::endl;
+  });
+
+  int port = 4567;
+  if (h.listen(port)) {
+    std::cout << "Listening to port " << port << std::endl;
+  } else {
+    std::cerr << "Failed to listen to port" << std::endl;
+    return -1;
+  }
+  h.run();
+}

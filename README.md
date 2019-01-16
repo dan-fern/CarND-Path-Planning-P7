@@ -1,6 +1,48 @@
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
-   
+
+### Introduction
+
+This project's project is to design a highway driving path planner and test it in simulation with traffic, telemetry, and sensor fusion data.  To do this, the car must satisfy several velocity, acceleration, and jerk motion constraints along with the more obvious objectives of avoiding collisions, staying within lane markers (other than lane changes), and achieving a high average velocity in traffic by changing lanes and obeying the posted speed limit.  
+
+#### 1. Interpolate waypoints of nearby area.
+
+Track waypoints are listed in `highway_map.csv` and are spaced roughly 30 meters apart.  Therefore, nearby map waypoints must be interpolated to produce closer spaced (0.5m) waypoints.  In this case, five waypoints ahead and five waypoints behind the ego vehicle are used.  This will help produce more accurate results from the `getXY( )` and `getFrenet( )` functions and will also account for the discontinuity in **s** values at the end/beginning of the track.
+
+#### 2. Determine ego vehicle parameters and populate vehicle class.
+
+Instantaneous telemetry data for the ego vehicle is provided by the simulator as well as a list of points from the previous path.  This can be used to project the car's state into the future to generate smoother transitions.  
+
+The vehicle state and its associated methods are contained in the `Vehicle` class. These methods include:
+* `update_available_moves( )` - "keep lane", "lane change left", "lane change right",
+* `get_move_target( )`,
+* `generate_target_traj( )`,
+* `get_lead_car_data( )`, and
+* `generate_predictions( )` - for sensor fusion data.
+
+#### 3. Use sensor fusion data to generate predictions.
+
+Sensor fusion data received in from the simulator is parsed so that trajectories for each of the other cars on the road are generated.  These trajectories match the ego car trajectory's duration and interval generated for each future state.  They are then ready to have the cost assessed.
+
+#### 4. Calculate total cost and determine best trajectory.
+
+Each available state is given a target Frenet state (position, velocity, and acceleration in both s and d dimensions) based on the current state and the traffic predictions.  A jerk-minimizing trajectory is produced for each available state and target.  By comparing the expected states of the ego car to the predicted states of the other vehicles, an overall cost function can be used to assess which trajectory the ego vehicle should carry out.  These included:
+* Collision cost: penalize a trajectory that collides with any predicted traffic trajectories
+* Buffer cost: penalizes a trajectory that comes within a certain distance of another traffic vehicle trajectory.
+* In-lane buffer cost: penalizes driving in lanes with relatively nearby traffic.
+* Exceed-speed-limit cost: penalizes trajectories where the vehicle exceeds the speed limit
+* Efficiency cost: penalizes trajectories with lower target velocity, while keeping speed limit in mind.
+* Outer-lane cost: lightly penalizes driving in any lane other than the center so that available state options may be maximized.
+
+#### 5. Generate and execute new path.
+
+The new path begins with a certain number of points from the previous path, which is read from the simulator at each iteration.  Then, a spline is generated beginning with the last two points of the previous path that have been kept and ending with two points 30 and 60 meters ahead in the target lane. The current position, heading, and velocity are used if no current path exists.  This produces a smooth x and y trajectory.  To prevent excessive acceleration and jerk, the velocity is only incremented or decremented by a small amount, and the corresponding next x and y points are calculated along the x and y splines created earlier.
+
+### Conclusion
+
+The resulting path planner performed well, but was not perfect.  It produced incident-free runs of greater than 5 miles.  One failure shows when there is considerable traffic.  Occasionally, the trajectory will toggle between 'LCL' and 'LCR' which may leave the vehicle hovering between two lanes.  I would penalize this toggling, but I couldn't find a safe way to do this that would not impede on the vehicle's abilty to take emergency evasive action.  Overall, I am very satisfied with its performance.
+
+
 ### Simulator.
 You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases/tag/T3_v1.2).  
 
@@ -13,7 +55,7 @@ sudo chmod u+x {simulator_file_name}
 In this project your goal is to safely navigate around a virtual highway with other traffic that is driving +-10 MPH of the 50 MPH speed limit. You will be provided the car's localization and sensor fusion data, there is also a sparse map list of waypoints around the highway. The car should try to go as close as possible to the 50 MPH speed limit, which means passing slower traffic when possible, note that other cars will try to change lanes too. The car should avoid hitting other cars at all cost as well as driving inside of the marked road lanes at all times, unless going from one lane to another. The car should be able to make one complete loop around the 6946m highway. Since the car is trying to go 50 MPH, it should take a little over 5 minutes to complete 1 loop. Also the car should not experience total acceleration over 10 m/s^2 and jerk that is greater than 10 m/s^3.
 
 #### The map of the highway is in data/highway_map.txt
-Each waypoint in the list contains  [x,y,s,dx,dy] values. x and y are the waypoint's map coordinate position, the s value is the distance along the road to get to that waypoint in meters, the dx and dy values define the unit normal vector pointing outward of the highway loop.
+Each waypoint in the list contains [x,y,s,dx,dy] values. x and y are the waypoint's map coordinate position, the s value is the distance along the road to get to that waypoint in meters, the dx and dy values define the unit normal vector pointing outward of the highway loop.
 
 The highway's waypoints loop around so the frenet s value, distance along the road, goes from 0 to 6945.554.
 
@@ -43,13 +85,13 @@ Here is the data provided from the Simulator to the C++ Program
 #### Previous path data given to the Planner
 
 //Note: Return the previous list but with processed points removed, can be a nice tool to show how far along
-the path has processed since last time. 
+the path has processed since last time.
 
 ["previous_path_x"] The previous list of x points previously given to the simulator
 
 ["previous_path_y"] The previous list of y points previously given to the simulator
 
-#### Previous path's end s and d values 
+#### Previous path's end s and d values
 
 ["end_path_s"] The previous list's last point's frenet s value
 
@@ -57,7 +99,7 @@ the path has processed since last time.
 
 #### Sensor Fusion Data, a list of all other car's attributes on the same side of the road. (No Noise)
 
-["sensor_fusion"] A 2d vector of cars and then that car's [car's unique ID, car's x position in map coordinates, car's y position in map coordinates, car's x velocity in m/s, car's y velocity in m/s, car's s position in frenet coordinates, car's d position in frenet coordinates. 
+["sensor_fusion"] A 2d vector of cars and then that car's [car's unique ID, car's x position in map coordinates, car's y position in map coordinates, car's x velocity in m/s, car's y velocity in m/s, car's s position in frenet coordinates, car's d position in frenet coordinates.
 
 ## Details
 
@@ -87,7 +129,7 @@ A really helpful resource for doing this project and creating smooth trajectorie
   * Run either `install-mac.sh` or `install-ubuntu.sh`.
   * If you install from source, checkout to commit `e94b6e1`, i.e.
     ```
-    git clone https://github.com/uWebSockets/uWebSockets 
+    git clone https://github.com/uWebSockets/uWebSockets
     cd uWebSockets
     git checkout e94b6e1
     ```
@@ -142,4 +184,3 @@ still be compilable with cmake and make./
 
 ## How to write a README
 A well written README file can enhance your project and portfolio.  Develop your abilities to create professional README files by completing [this free course](https://www.udacity.com/course/writing-readmes--ud777).
-
